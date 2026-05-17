@@ -290,31 +290,41 @@ def reconcile_crypto_protective_orders(client, positions, crypto_bars):
         log.error(f"[reconcile] failed to list open orders: {e}")
         return
 
-    # Pass 1: cancel orphan SELL stops/limits for crypto symbols with no position
+    # Pass 1: cancel any crypto SELL order that's not a STOP_LIMIT on an active position.
+    # Specifically:
+    #   - Orphan SELL STOP_LIMIT / LIMIT (no underlying position) -> stale, clean up
+    #   - SELL LIMIT on an active position -> conflicts with the STOP_LIMIT we want to
+    #     place, since Alpaca crypto reserves the full qty per open sell order (no OCO)
     for o in open_orders:
         if not _is_crypto_symbol(o.symbol):
             continue
-        if _norm_symbol(o.symbol) in crypto_positions:
-            continue
         if o.side != OrderSide.SELL:
+            continue
+        is_orphan = _norm_symbol(o.symbol) not in crypto_positions
+        is_stale_limit = (not is_orphan) and o.order_type == OrderType.LIMIT
+        if not (is_orphan or is_stale_limit):
             continue
         if o.order_type not in (OrderType.STOP_LIMIT, OrderType.LIMIT):
             continue
+        reason = "orphan" if is_orphan else "stale limit on position"
         if DRY_RUN:
-            log.info(f"[reconcile] DRY-RUN would cancel orphan {o.order_type.value} {o.symbol} id={o.id}")
+            log.info(f"[reconcile] DRY-RUN would cancel {reason} {o.order_type.value} {o.symbol} id={o.id}")
             continue
         try:
             client.cancel_order_by_id(o.id)
-            log.info(f"[reconcile] cancelled orphan {o.order_type.value} {o.symbol} id={o.id}")
+            log.info(f"[reconcile] cancelled {reason} {o.order_type.value} {o.symbol} id={o.id}")
         except Exception as e:
             log.error(f"[reconcile] cancel {o.id} failed: {e}")
 
-    # Pass 2: for each crypto position, ensure both stop and limit exist
+    # Pass 2: for each crypto position, ensure a SELL STOP_LIMIT exists.
+    # We can't have a take-profit LIMIT at the same time because Alpaca crypto
+    # has no OCO support and reserves the full qty per open sell order. The
+    # stop-loss is the critical protection; profit-taking happens via signal
+    # flip in the main loop, which closes the position when momentum turns.
     for sym, pos in crypto_positions.items():
         sells = [o for o in open_orders if _norm_symbol(o.symbol) == sym and o.side == OrderSide.SELL]
         has_stop = any(o.order_type == OrderType.STOP_LIMIT for o in sells)
-        has_limit = any(o.order_type == OrderType.LIMIT for o in sells)
-        if has_stop and has_limit:
+        if has_stop:
             continue
 
         slash_sym = _to_slash_symbol(sym)
@@ -331,43 +341,24 @@ def reconcile_crypto_protective_orders(client, positions, crypto_bars):
         qty = abs(float(pos.qty))
         entry = float(pos.avg_entry_price)
         stop_price = round(entry - CFG.STOP_ATR_MULT * float(atr_v), 2)
-        target_price = round(entry + CFG.TARGET_ATR_MULT * float(atr_v), 2)
+        # Allow 0.5% slippage below the trigger so the limit usually fills on fast moves
+        limit_after_trigger = round(stop_price * 0.995, 2)
 
-        if not has_stop:
-            # Alpaca crypto only supports stop_limit (not plain stop). Allow 0.5%
-            # slippage below the trigger so the limit usually fills even on fast moves.
-            limit_after_trigger = round(stop_price * 0.995, 2)
-            if DRY_RUN:
-                log.info(f"[reconcile] DRY-RUN would place SELL STOP_LIMIT {sym} qty={qty} stop={stop_price} limit={limit_after_trigger}")
-            else:
-                try:
-                    client.submit_order(StopLimitOrderRequest(
-                        symbol=slash_sym,
-                        qty=qty,
-                        side=OrderSide.SELL,
-                        stop_price=stop_price,
-                        limit_price=limit_after_trigger,
-                        time_in_force=TimeInForce.GTC,
-                    ))
-                    log.info(f"[reconcile] placed SELL STOP_LIMIT {sym} qty={qty} stop={stop_price} limit={limit_after_trigger}")
-                except Exception as e:
-                    log.error(f"[reconcile] stop placement {sym} failed: {e}")
-
-        if not has_limit:
-            if DRY_RUN:
-                log.info(f"[reconcile] DRY-RUN would place SELL LIMIT {sym} qty={qty} @ {target_price}")
-            else:
-                try:
-                    client.submit_order(LimitOrderRequest(
-                        symbol=slash_sym,
-                        qty=qty,
-                        side=OrderSide.SELL,
-                        limit_price=target_price,
-                        time_in_force=TimeInForce.GTC,
-                    ))
-                    log.info(f"[reconcile] placed SELL LIMIT {sym} qty={qty} @ {target_price}")
-                except Exception as e:
-                    log.error(f"[reconcile] limit placement {sym} failed: {e}")
+        if DRY_RUN:
+            log.info(f"[reconcile] DRY-RUN would place SELL STOP_LIMIT {sym} qty={qty} stop={stop_price} limit={limit_after_trigger}")
+            continue
+        try:
+            client.submit_order(StopLimitOrderRequest(
+                symbol=slash_sym,
+                qty=qty,
+                side=OrderSide.SELL,
+                stop_price=stop_price,
+                limit_price=limit_after_trigger,
+                time_in_force=TimeInForce.GTC,
+            ))
+            log.info(f"[reconcile] placed SELL STOP_LIMIT {sym} qty={qty} stop={stop_price} limit={limit_after_trigger}")
+        except Exception as e:
+            log.error(f"[reconcile] stop placement {sym} failed: {e}")
 
 
 # ----------------------------------------------------------------------------
