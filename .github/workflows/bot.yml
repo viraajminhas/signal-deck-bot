@@ -2,10 +2,11 @@ name: SignalDeck Bot
 
 on:
   schedule:
-    # Every 5 min, weekdays, 13:00-21:55 UTC.
-    # Covers US RTH (9:30-16:00 ET) in both EST and EDT plus EOD-flatten buffer.
+    # Every 5 min, 24/7. Bot self-gates equities on Alpaca's market clock
+    # so stocks only trade during RTH; crypto trades whenever this fires
+    # (including overnight + weekends).
     # GitHub cron is best-effort: can drift by several minutes during peak load.
-    - cron: '*/5 13-21 * * 1-5'
+    - cron: '*/5 * * * *'
   workflow_dispatch:  # manual trigger from the Actions tab
 
 jobs:
