@@ -36,7 +36,7 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
-    StopOrderRequest,
+    StopLimitOrderRequest,
     LimitOrderRequest,
     GetOrdersRequest,
 )
@@ -259,7 +259,14 @@ def _is_crypto_symbol(sym: str) -> bool:
 
 def _to_slash_symbol(sym: str) -> str:
     """'BTCUSD' -> 'BTC/USD' (alpaca-py requires slashed form for new orders)."""
+    if "/" in sym:
+        return sym
     return sym[:-3] + "/" + sym[-3:]
+
+
+def _norm_symbol(sym: str) -> str:
+    """Normalize for comparison. Positions come back as 'BTCUSD'; orders as 'BTC/USD'."""
+    return sym.replace("/", "")
 
 
 def reconcile_crypto_protective_orders(client, positions, crypto_bars):
@@ -272,7 +279,9 @@ def reconcile_crypto_protective_orders(client, positions, crypto_bars):
 
     Brackets aren't supported on Alpaca crypto, so we manually maintain the
     stop+limit pair and cancel the leftover when one fills."""
-    crypto_positions = {p.symbol: p for p in positions if _is_crypto_symbol(p.symbol)}
+    # Keyed by normalized symbol ("BTCUSD") so we can compare against both
+    # position.symbol (no slash) and order.symbol (with slash) uniformly.
+    crypto_positions = {_norm_symbol(p.symbol): p for p in positions if _is_crypto_symbol(p.symbol)}
 
     try:
         open_orders = client.get_orders(filter=GetOrdersRequest(
@@ -285,11 +294,11 @@ def reconcile_crypto_protective_orders(client, positions, crypto_bars):
     for o in open_orders:
         if not _is_crypto_symbol(o.symbol):
             continue
-        if o.symbol in crypto_positions:
+        if _norm_symbol(o.symbol) in crypto_positions:
             continue
         if o.side != OrderSide.SELL:
             continue
-        if o.order_type not in (OrderType.STOP, OrderType.LIMIT):
+        if o.order_type not in (OrderType.STOP_LIMIT, OrderType.LIMIT):
             continue
         if DRY_RUN:
             log.info(f"[reconcile] DRY-RUN would cancel orphan {o.order_type.value} {o.symbol} id={o.id}")
@@ -302,8 +311,8 @@ def reconcile_crypto_protective_orders(client, positions, crypto_bars):
 
     # Pass 2: for each crypto position, ensure both stop and limit exist
     for sym, pos in crypto_positions.items():
-        sells = [o for o in open_orders if o.symbol == sym and o.side == OrderSide.SELL]
-        has_stop = any(o.order_type == OrderType.STOP for o in sells)
+        sells = [o for o in open_orders if _norm_symbol(o.symbol) == sym and o.side == OrderSide.SELL]
+        has_stop = any(o.order_type == OrderType.STOP_LIMIT for o in sells)
         has_limit = any(o.order_type == OrderType.LIMIT for o in sells)
         if has_stop and has_limit:
             continue
@@ -325,18 +334,22 @@ def reconcile_crypto_protective_orders(client, positions, crypto_bars):
         target_price = round(entry + CFG.TARGET_ATR_MULT * float(atr_v), 2)
 
         if not has_stop:
+            # Alpaca crypto only supports stop_limit (not plain stop). Allow 0.5%
+            # slippage below the trigger so the limit usually fills even on fast moves.
+            limit_after_trigger = round(stop_price * 0.995, 2)
             if DRY_RUN:
-                log.info(f"[reconcile] DRY-RUN would place SELL STOP {sym} qty={qty} @ {stop_price}")
+                log.info(f"[reconcile] DRY-RUN would place SELL STOP_LIMIT {sym} qty={qty} stop={stop_price} limit={limit_after_trigger}")
             else:
                 try:
-                    client.submit_order(StopOrderRequest(
+                    client.submit_order(StopLimitOrderRequest(
                         symbol=slash_sym,
                         qty=qty,
                         side=OrderSide.SELL,
                         stop_price=stop_price,
+                        limit_price=limit_after_trigger,
                         time_in_force=TimeInForce.GTC,
                     ))
-                    log.info(f"[reconcile] placed SELL STOP {sym} qty={qty} @ {stop_price}")
+                    log.info(f"[reconcile] placed SELL STOP_LIMIT {sym} qty={qty} stop={stop_price} limit={limit_after_trigger}")
                 except Exception as e:
                     log.error(f"[reconcile] stop placement {sym} failed: {e}")
 
