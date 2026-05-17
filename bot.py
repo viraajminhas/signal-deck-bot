@@ -32,8 +32,15 @@ os.chdir(BASE)
 sys.path.insert(0, str(BASE))
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    TakeProfitRequest,
+    StopLossRequest,
+    StopOrderRequest,
+    LimitOrderRequest,
+    GetOrdersRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, OrderType, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -245,36 +252,109 @@ def submit_crypto_market(client, db, symbol, side, qty, entry, stop, target, rea
     return order
 
 
-def manage_crypto_exits(client, db, positions):
-    """Crypto can't use bracket orders. Check open crypto positions vs stored stop/target; exit if hit."""
-    for pos in positions:
-        sym = pos.symbol  # comes back like "BTCUSD"
-        if "USD" not in sym or len(sym) < 6:
+def _is_crypto_symbol(sym: str) -> bool:
+    """Alpaca returns crypto symbols without slash ('BTCUSD'). Equities are typically <=5 letters."""
+    return len(sym) >= 6 and sym.endswith("USD")
+
+
+def _to_slash_symbol(sym: str) -> str:
+    """'BTCUSD' -> 'BTC/USD' (alpaca-py requires slashed form for new orders)."""
+    return sym[:-3] + "/" + sym[-3:]
+
+
+def reconcile_crypto_protective_orders(client, positions, crypto_bars):
+    """Stateless reconciler. Runs every cycle:
+      - For each crypto long position, ensure a SELL STOP and a SELL LIMIT exist on Alpaca.
+        Stop/target are re-derived from the position's avg_entry_price + current ATR
+        (so we don't depend on bot.db, which is ephemeral in the cloud).
+      - For each open crypto SELL stop/limit with no underlying position, cancel it
+        (orphan from a position that already closed via the other leg).
+
+    Brackets aren't supported on Alpaca crypto, so we manually maintain the
+    stop+limit pair and cancel the leftover when one fills."""
+    crypto_positions = {p.symbol: p for p in positions if _is_crypto_symbol(p.symbol)}
+
+    try:
+        open_orders = client.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.OPEN, limit=200))
+    except Exception as e:
+        log.error(f"[reconcile] failed to list open orders: {e}")
+        return
+
+    # Pass 1: cancel orphan SELL stops/limits for crypto symbols with no position
+    for o in open_orders:
+        if not _is_crypto_symbol(o.symbol):
             continue
-        # Lookup last open order for this position
-        slash_sym = sym[:-3] + "/" + sym[-3:]
-        cur = db.execute(
-            "SELECT stop_price, target_price, side FROM orders WHERE symbol IN (?, ?) AND status != 'dry_run' ORDER BY id DESC LIMIT 1",
-            (sym, slash_sym),
-        )
-        row = cur.fetchone()
-        if not row:
+        if o.symbol in crypto_positions:
             continue
-        stop_p, target_p, side = row
-        current = float(pos.current_price) if pos.current_price else None
-        if not current or not stop_p or not target_p:
+        if o.side != OrderSide.SELL:
+            continue
+        if o.order_type not in (OrderType.STOP, OrderType.LIMIT):
+            continue
+        if DRY_RUN:
+            log.info(f"[reconcile] DRY-RUN would cancel orphan {o.order_type.value} {o.symbol} id={o.id}")
+            continue
+        try:
+            client.cancel_order_by_id(o.id)
+            log.info(f"[reconcile] cancelled orphan {o.order_type.value} {o.symbol} id={o.id}")
+        except Exception as e:
+            log.error(f"[reconcile] cancel {o.id} failed: {e}")
+
+    # Pass 2: for each crypto position, ensure both stop and limit exist
+    for sym, pos in crypto_positions.items():
+        sells = [o for o in open_orders if o.symbol == sym and o.side == OrderSide.SELL]
+        has_stop = any(o.order_type == OrderType.STOP for o in sells)
+        has_limit = any(o.order_type == OrderType.LIMIT for o in sells)
+        if has_stop and has_limit:
             continue
 
-        hit_stop = (side == "long" and current <= stop_p) or (side == "short" and current >= stop_p)
-        hit_target = (side == "long" and current >= target_p) or (side == "short" and current <= target_p)
-        if hit_stop or hit_target:
-            reason = "stop" if hit_stop else "target"
-            log.info(f"[exit] {sym}: hit {reason} @ {current:.2f} (stop {stop_p}, target {target_p})")
-            if not DRY_RUN:
+        slash_sym = _to_slash_symbol(sym)
+        df = crypto_bars.get(slash_sym)
+        if df is None or len(df) < 20:
+            log.info(f"[reconcile] {sym}: no fresh bars, skipping stop placement")
+            continue
+
+        atr_v = atr(df).iloc[-1]
+        if pd.isna(atr_v) or atr_v <= 0:
+            log.info(f"[reconcile] {sym}: bad ATR, skipping")
+            continue
+
+        qty = abs(float(pos.qty))
+        entry = float(pos.avg_entry_price)
+        stop_price = round(entry - CFG.STOP_ATR_MULT * float(atr_v), 2)
+        target_price = round(entry + CFG.TARGET_ATR_MULT * float(atr_v), 2)
+
+        if not has_stop:
+            if DRY_RUN:
+                log.info(f"[reconcile] DRY-RUN would place SELL STOP {sym} qty={qty} @ {stop_price}")
+            else:
                 try:
-                    client.close_position(sym)
+                    client.submit_order(StopOrderRequest(
+                        symbol=slash_sym,
+                        qty=qty,
+                        side=OrderSide.SELL,
+                        stop_price=stop_price,
+                        time_in_force=TimeInForce.GTC,
+                    ))
+                    log.info(f"[reconcile] placed SELL STOP {sym} qty={qty} @ {stop_price}")
                 except Exception as e:
-                    log.error(f"failed to close {sym}: {e}")
+                    log.error(f"[reconcile] stop placement {sym} failed: {e}")
+
+        if not has_limit:
+            if DRY_RUN:
+                log.info(f"[reconcile] DRY-RUN would place SELL LIMIT {sym} qty={qty} @ {target_price}")
+            else:
+                try:
+                    client.submit_order(LimitOrderRequest(
+                        symbol=slash_sym,
+                        qty=qty,
+                        side=OrderSide.SELL,
+                        limit_price=target_price,
+                        time_in_force=TimeInForce.GTC,
+                    ))
+                    log.info(f"[reconcile] placed SELL LIMIT {sym} qty={qty} @ {target_price}")
+                except Exception as e:
+                    log.error(f"[reconcile] limit placement {sym} failed: {e}")
 
 
 # ----------------------------------------------------------------------------
@@ -339,8 +419,9 @@ def main():
     held_alpaca_syms = {p.symbol for p in positions}
     total_trades, per_symbol_trades = count_trades_today(trading)
 
-    # Crypto exit management (brackets don't apply to crypto)
-    manage_crypto_exits(trading, db, positions)
+    # Crypto: ensure server-side stop+limit sells exist for each long position;
+    # cancel orphans when one leg fills. Stateless (no DB dependency).
+    reconcile_crypto_protective_orders(trading, positions, crypto_bars)
 
     # Iterate candidates
     candidates = [(s, df, "equity") for s, df in stock_bars.items()] + \
@@ -430,6 +511,17 @@ def main():
             per_symbol_trades[api_sym] = per_symbol_trades.get(api_sym, 0) + 1
         except Exception as e:
             log.error(f"{symbol}: order failed: {e}\n{traceback.format_exc()}")
+
+    # Post-entry reconcile: if any crypto entries were submitted this cycle,
+    # give Alpaca a moment to fill them, then re-place protective stops so we
+    # don't wait a full 5-min cycle for the next reconciler to catch up.
+    if actions > 0 and not DRY_RUN:
+        time.sleep(2)
+        try:
+            fresh_positions = trading.get_all_positions()
+            reconcile_crypto_protective_orders(trading, fresh_positions, crypto_bars)
+        except Exception as e:
+            log.error(f"post-entry reconcile failed: {e}")
 
     DB.log_run(db, equity, cash, bp, len(positions), total_trades,
                daily_pnl_pct(trading), False, f"actions={actions}")
