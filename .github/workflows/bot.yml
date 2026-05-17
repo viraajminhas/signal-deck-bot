@@ -1,0 +1,37 @@
+name: SignalDeck Bot
+
+on:
+  schedule:
+    # Every 5 min, weekdays, 13:00-21:55 UTC.
+    # Covers US RTH (9:30-16:00 ET) in both EST and EDT plus EOD-flatten buffer.
+    # GitHub cron is best-effort: can drift by several minutes during peak load.
+    - cron: '*/5 13-21 * * 1-5'
+  workflow_dispatch:  # manual trigger from the Actions tab
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    concurrency:
+      group: signal-deck-bot
+      cancel-in-progress: false  # let an in-flight run finish before starting a new one
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          # Set repo variable DRY_RUN=0 to enable live paper-trading execution.
+          # Missing or empty => bot stays in dry-run mode.
+          DRY_RUN: ${{ vars.DRY_RUN || '1' }}
+        run: python bot.py
