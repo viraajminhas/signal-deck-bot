@@ -43,47 +43,83 @@ trade fires only when `|ensemble score| ≥ 0.40`.
 **Existing positions**: never stack into the same symbol on one cycle. If the
 ensemble flips sign, the position is closed (not reversed in same cycle).
 
-## Setup
+## Deployment: GitHub Actions (primary)
 
-1. **Install dependencies** (already done if you can run `python bot.py`):
-   ```powershell
-   pip install -r requirements.txt
-   ```
+The bot runs in the cloud on GitHub Actions cron — your PC doesn't need to be on.
 
-2. **Check `.env`** — already populated with your paper-trading keys:
-   ```
-   ALPACA_API_KEY=...
-   ALPACA_SECRET_KEY=...
-   DRY_RUN=1
-   ```
-   Leave `DRY_RUN=1` until you've watched a few live cycles. The bot will log
-   what it *would* have done without sending orders.
+Repo: https://github.com/viraajminhas/signal-deck-bot (public so Actions minutes are unlimited; secrets stay encrypted regardless of repo visibility)
 
-3. **Dry-run once manually** to confirm wiring:
-   ```powershell
-   python bot.py
-   ```
-   Inspect `bot.log` and `bot.db`.
+- Workflow: `.github/workflows/bot.yml`
+- Cron: `*/5 13-21 * * 1-5` (every 5 min, weekdays, 13:00–21:55 UTC; covers US RTH for both EST and EDT)
+- Secrets: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY` (set via repo Settings → Secrets and variables → Actions)
+- Variables: `DRY_RUN` (`'1'` = log only, `'0'` = live paper-trade execution; default `'1'` if unset)
 
-4. **Register with Task Scheduler** (elevated PowerShell):
-   ```powershell
-   PowerShell -ExecutionPolicy Bypass -File .\setup_scheduler.ps1
-   ```
-   Cadence: every 5 minutes, Mon–Fri, 6:00 AM – 8:00 PM local time. (The bot
-   self-gates on Alpaca's market clock, so wide local hours cover ET RTH from
-   any US timezone and let crypto trade outside RTH.)
-
-5. **Flip to live paper execution** when you're satisfied:
-   - Edit `.env` → `DRY_RUN=0`
-   - No restart needed; next scheduled run picks it up.
-
-## Watching it
+### Flip from dry-run to live
 
 ```powershell
-# Tail the log live
+gh variable set DRY_RUN -b "0"
+```
+
+Or via the GitHub web UI: Settings → Secrets and variables → Actions → Variables → New variable → `DRY_RUN` = `0`. Takes effect on the next scheduled run; no redeploy needed.
+
+To go back to dry-run:
+```powershell
+gh variable set DRY_RUN -b "1"
+```
+
+### Watching it
+
+```powershell
+# Trigger a one-off run on demand
+gh workflow run "SignalDeck Bot"
+
+# Tail the most recent run live
+gh run watch
+
+# Pull bot output from a specific run
+gh run view <run-id> --log | Select-String -Pattern "===|mf=|ens|DRY-RUN|SUBMITTED|HALTED|ERROR"
+
+# Just show recent runs
+gh run list --workflow="SignalDeck Bot" --limit 10
+```
+
+Or in the [Alpaca paper dashboard](https://app.alpaca.markets/paper/dashboard/overview)
+under Activity → Orders / Positions for placed trades.
+
+### Killing it
+
+```powershell
+# Pause the workflow (preserves history, resumable later)
+gh workflow disable "SignalDeck Bot"
+
+# Re-enable
+gh workflow enable "SignalDeck Bot"
+
+# Or delete the whole repo entirely
+gh repo delete viraajminhas/signal-deck-bot --yes
+```
+
+Open positions stay open until manually closed in the Alpaca dashboard.
+
+## Local execution (secondary)
+
+If you want to run the bot manually for one-off testing or debugging:
+
+```powershell
+# Populate .env (already done locally; not committed)
+# ALPACA_API_KEY=...
+# ALPACA_SECRET_KEY=...
+# DRY_RUN=1
+
+pip install -r requirements.txt
+python bot.py
+```
+
+Local runs write to `bot.db` (SQLite) and `bot.log`. Inspect with:
+
+```powershell
 Get-Content .\bot.log -Tail 50 -Wait
 
-# Inspect the DB
 sqlite3 .\bot.db
 > SELECT ts, equity, daily_pnl_pct, trades_today, halted, notes FROM runs ORDER BY id DESC LIMIT 10;
 > SELECT ts, symbol, ensemble, decision FROM signals ORDER BY id DESC LIMIT 20;
@@ -91,8 +127,7 @@ sqlite3 .\bot.db
 > SELECT * FROM halts ORDER BY id DESC LIMIT 5;
 ```
 
-Or in the [Alpaca paper dashboard](https://app.alpaca.markets/paper/dashboard/overview)
-under Activity → Orders / Positions.
+If you ever want to schedule local runs as well (e.g. for crypto coverage on weekends), `setup_scheduler.ps1` will register a Windows Task Scheduler entry. **Important: do not run both local Task Scheduler and GitHub Actions in live mode simultaneously — you'll place duplicate orders.**
 
 ## Limitations to know about
 
