@@ -12,19 +12,19 @@ class Config:
     EQUITIES: tuple = ("SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOG", "TSLA")
     CRYPTO: tuple = ("BTC/USD", "ETH/USD")
 
-    # ---- Risk caps (Moderate profile) ----
-    RISK_PER_TRADE_PCT: float = 0.02          # 2% of equity at risk per trade
-    MAX_DAILY_LOSS_PCT: float = 0.05          # halt for the day if equity down 5%
-    MAX_CONCURRENT_POSITIONS: int = 6
-    MAX_TRADES_PER_DAY: int = 20
-    MAX_TRADES_PER_SYMBOL_PER_DAY: int = 3
+    # ---- Risk caps (Aggressive profile) ----
+    RISK_PER_TRADE_PCT: float = 0.03          # 3% of equity at risk per trade
+    MAX_DAILY_LOSS_PCT: float = 0.08          # halt for the day if equity down 8%
+    MAX_CONCURRENT_POSITIONS: int = 8
+    MAX_TRADES_PER_DAY: int = 40
+    MAX_TRADES_PER_SYMBOL_PER_DAY: int = 5
     CONSECUTIVE_LOSS_HALT: int = 3            # halt after 3 consecutive losers
-    MAX_POSITION_VALUE_PCT: float = 0.25      # cap any one position at 25% of equity
+    MAX_POSITION_VALUE_PCT: float = 0.30      # cap any one position at 30% of equity
 
     # ---- Strategy ----
     BAR_LOOKBACK_DAYS: int = 5
     BAR_TIMEFRAME_MIN: int = 5                # 5-min bars
-    MIN_ENSEMBLE_SCORE: float = 0.40          # min |score| to take a trade
+    MIN_ENSEMBLE_SCORE: float = 0.20          # min |score| to take a trade (was 0.40)
     SIGNAL_WEIGHTS: dict = field(default_factory=lambda: {
         "multifactor": 0.40,
         "mean_rev":   0.30,
